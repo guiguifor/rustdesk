@@ -35,8 +35,8 @@ use hbb_common::{
 use crate::client::io_loop::Remote;
 use crate::client::{
     check_if_retry, handle_hash, handle_login_error, handle_login_from_ui, handle_test_delay,
-    input_os_password, send_mouse, send_pointer_device_event, start_video_audio_threads,
-    FileManager, Key, LoginConfigHandler, QualityStatus, KEY_MAP,
+    input_os_password, send_mouse, send_pointer_device_event, FileManager, Key, LoginConfigHandler,
+    QualityStatus, KEY_MAP,
 };
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use crate::common::GrabState;
@@ -58,6 +58,7 @@ pub struct Session<T: InvokeUiSession> {
     pub server_clipboard_enabled: Arc<RwLock<bool>>,
     pub last_change_display: Arc<Mutex<ChangeDisplayRecord>>,
     pub connection_round_state: Arc<Mutex<ConnectionRoundState>>,
+    pub printer_names: Arc<RwLock<HashMap<i32, String>>>,
 }
 
 #[derive(Clone)]
@@ -162,6 +163,13 @@ impl SessionPermissionConfig {
             && *self.server_keyboard_enabled.read().unwrap()
             && !self.lc.read().unwrap().disable_clipboard.v
     }
+
+    #[cfg(feature = "unix-file-copy-paste")]
+    pub fn is_file_clipboard_required(&self) -> bool {
+        *self.server_keyboard_enabled.read().unwrap()
+            && *self.server_file_transfer_enabled.read().unwrap()
+            && self.lc.read().unwrap().enable_file_copy_paste.v
+    }
 }
 
 impl<T: InvokeUiSession> Session<T> {
@@ -181,6 +189,10 @@ impl<T: InvokeUiSession> Session<T> {
             .unwrap()
             .conn_type
             .eq(&ConnType::FILE_TRANSFER)
+    }
+
+    pub fn is_view_camera(&self) -> bool {
+        self.lc.read().unwrap().conn_type.eq(&ConnType::VIEW_CAMERA)
     }
 
     pub fn is_port_forward(&self) -> bool {
@@ -324,7 +336,7 @@ impl<T: InvokeUiSession> Session<T> {
 
     pub fn toggle_option(&self, name: String) {
         let msg = self.lc.write().unwrap().toggle_option(name.clone());
-        #[cfg(not(feature = "flutter"))]
+        #[cfg(all(target_os = "windows", not(feature = "flutter")))]
         if name == hbb_common::config::keys::OPTION_ENABLE_FILE_COPY_PASTE {
             self.send(Data::ToggleClipboardFile);
         }
@@ -354,11 +366,18 @@ impl<T: InvokeUiSession> Session<T> {
         self.lc.read().unwrap().is_privacy_mode_supported()
     }
 
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[cfg(not(target_os = "ios"))]
     pub fn is_text_clipboard_required(&self) -> bool {
         *self.server_clipboard_enabled.read().unwrap()
             && *self.server_keyboard_enabled.read().unwrap()
             && !self.lc.read().unwrap().disable_clipboard.v
+    }
+
+    #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
+    pub fn is_file_clipboard_required(&self) -> bool {
+        *self.server_keyboard_enabled.read().unwrap()
+            && *self.server_file_transfer_enabled.read().unwrap()
+            && self.lc.read().unwrap().enable_file_copy_paste.v
     }
 
     #[cfg(feature = "flutter")]
@@ -390,16 +409,11 @@ impl<T: InvokeUiSession> Session<T> {
     }
 
     pub fn record_screen(&self, start: bool) {
-        let mut misc = Misc::new();
-        misc.set_client_record_status(start);
-        let mut msg = Message::new();
-        msg.set_misc(misc);
-        self.send(Data::Message(msg));
         self.send(Data::RecordScreen(start));
     }
 
     pub fn is_recording(&self) -> bool {
-        self.lc.read().unwrap().record
+        self.lc.read().unwrap().record_state
     }
 
     pub fn save_custom_image_quality(&self, custom_image_quality: i32) {
@@ -475,14 +489,14 @@ impl<T: InvokeUiSession> Session<T> {
         (vp8, av1, h264, h265)
     }
 
-    pub fn change_prefer_codec(&self) {
+    pub fn update_supported_decodings(&self) {
         let msg = self.lc.write().unwrap().update_supported_decodings();
         self.send(Data::Message(msg));
     }
 
     pub fn use_texture_render_changed(&self) {
         self.send(Data::ResetDecoder(None));
-        self.change_prefer_codec();
+        self.update_supported_decodings();
         self.send(Data::Message(LoginConfigHandler::refresh()));
     }
 
@@ -526,10 +540,7 @@ impl<T: InvokeUiSession> Session<T> {
     #[cfg(not(feature = "flutter"))]
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     pub fn is_xfce(&self) -> bool {
-        #[cfg(not(any(target_os = "ios")))]
-        return crate::platform::is_xfce();
-        #[cfg(any(target_os = "ios"))]
-        false
+        crate::platform::is_xfce()
     }
 
     pub fn remove_port_forward(&self, port: i32) {
@@ -1397,9 +1408,10 @@ impl<T: InvokeUiSession> Session<T> {
 
     #[inline]
     fn try_change_init_resolution(&self, display: i32) {
-        if let Some((w, h)) = self.lc.read().unwrap().get_custom_resolution(display) {
-            self.change_resolution(display, w, h);
-        }
+        let Some((w, h)) = self.lc.read().unwrap().get_custom_resolution(display) else {
+            return;
+        };
+        self.change_resolution(display, w, h);
     }
 
     fn do_change_resolution(&self, display: i32, width: i32, height: i32) {
@@ -1494,6 +1506,20 @@ impl<T: InvokeUiSession> Session<T> {
     pub fn get_conn_token(&self) -> Option<String> {
         self.lc.read().unwrap().get_conn_token()
     }
+
+    pub fn printer_response(&self, id: i32, path: String, printer_name: String) {
+        self.printer_names.write().unwrap().insert(id, printer_name);
+        let to = std::env::temp_dir().join(format!("rustdesk_printer_{id}"));
+        self.send(Data::SendFiles((
+            id,
+            hbb_common::fs::JobType::Printer,
+            path,
+            to.to_string_lossy().to_string(),
+            0,
+            false,
+            true,
+        )));
+    }
 }
 
 pub trait InvokeUiSession: Send + Sync + Clone + 'static + Sized + Default {
@@ -1558,6 +1584,8 @@ pub trait InvokeUiSession: Send + Sync + Clone + 'static + Sized + Default {
     #[cfg(feature = "flutter")]
     fn is_multi_ui_session(&self) -> bool;
     fn update_record_status(&self, start: bool);
+    fn update_empty_dirs(&self, _res: ReadEmptyDirsResponse) {}
+    fn printer_request(&self, id: i32, path: String);
 }
 
 impl<T: InvokeUiSession> Deref for Session<T> {
@@ -1622,7 +1650,12 @@ impl<T: InvokeUiSession> Interface for Session<T> {
             if pi.displays.is_empty() {
                 self.lc.write().unwrap().handle_peer_info(&pi);
                 self.update_privacy_mode();
-                self.msgbox("error", "Remote Error", "No Displays", "");
+                let msg = if self.is_view_camera() {
+                    "No cameras"
+                } else {
+                    "No displays"
+                };
+                self.msgbox("error", "Error", msg, "");
                 return;
             }
             self.try_change_init_resolution(pi.current_display);
@@ -1746,18 +1779,6 @@ impl<T: InvokeUiSession> Session<T> {
 
 #[tokio::main(flavor = "current_thread")]
 pub async fn io_loop<T: InvokeUiSession>(handler: Session<T>, round: u32) {
-    // It is ok to call this function multiple times.
-    #[cfg(any(
-        target_os = "windows",
-        all(
-            any(target_os = "linux", target_os = "macos"),
-            feature = "unix-file-copy-paste"
-        )
-    ))]
-    if !handler.is_file_transfer() && !handler.is_port_forward() {
-        clipboard::ContextSend::enable(true);
-    }
-
     #[cfg(any(target_os = "android", target_os = "ios"))]
     let (sender, receiver) = mpsc::unbounded_channel::<Data>();
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -1851,40 +1872,7 @@ pub async fn io_loop<T: InvokeUiSession>(handler: Session<T>, round: u32) {
         }
         return;
     }
-    let frame_count_map: Arc<RwLock<HashMap<usize, usize>>> = Default::default();
-    let frame_count_map_cl = frame_count_map.clone();
-    let ui_handler = handler.ui_handler.clone();
-    let (video_sender, audio_sender, video_queue_map, decode_fps, chroma) =
-        start_video_audio_threads(
-            handler.clone(),
-            move |display: usize,
-                  data: &mut scrap::ImageRgb,
-                  _texture: *mut c_void,
-                  pixelbuffer: bool| {
-                let mut write_lock = frame_count_map_cl.write().unwrap();
-                let count = write_lock.get(&display).unwrap_or(&0) + 1;
-                write_lock.insert(display, count);
-                drop(write_lock);
-                if pixelbuffer {
-                    ui_handler.on_rgba(display, data);
-                } else {
-                    #[cfg(all(feature = "vram", feature = "flutter"))]
-                    ui_handler.on_texture(display, _texture);
-                }
-            },
-        );
-
-    let mut remote = Remote::new(
-        handler,
-        video_queue_map,
-        video_sender,
-        audio_sender,
-        receiver,
-        sender,
-        frame_count_map,
-        decode_fps,
-        chroma,
-    );
+    let mut remote = Remote::new(handler, receiver, sender);
     remote.io_loop(&key, &token, round).await;
     remote.sync_jobs_status_to_local().await;
 }
